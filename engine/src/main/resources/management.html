@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Strategy container</title>
+<style>body{font:15px system-ui;background:#101820;color:#dae4ed;margin:0}main{max-width:1100px;margin:40px auto;padding:20px}h1{font-weight:500}section{background:#1a2834;padding:20px;margin:16px 0;border-radius:8px}input,select,button,textarea{font:inherit;padding:9px;margin:4px;border-radius:4px;border:1px solid #426079;background:#111d27;color:#dae4ed}button{cursor:pointer;background:#234f6b}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px;border-bottom:1px solid #334452}pre{white-space:pre-wrap;max-height:300px;overflow:auto}label{display:inline-block}small{color:#8eacbf}.grid{display:flex;flex-wrap:wrap;gap:8px}.danger{background:#6e3135}svg{width:100%;height:auto;display:block}.legend{display:flex;flex-wrap:wrap;gap:18px;margin:12px 0}.legend span{border-left:12px solid;padding-left:6px}fieldset[hidden]{display:none}</style>
+<main><h1>Strategy container</h1><small>Parents, constraints and execution state</small>
+<section><label>Management token <input id="token" type="password" autocomplete="off"></label><button id="connect">Connect</button><span id="connection">Disconnected</span></section>
+<section><h2>Parents</h2><button id="refresh">Refresh</button><label><input id="autoRefresh" type="checkbox" checked> Auto-refresh every second</label><small id="refreshStatus"></small><table><thead><tr><th>Parent</th><th>State</th><th>Venue fills</th><th>Wash fills</th><th>Reserved</th><th>Version</th><th>Inception mid</th><th>Shortfall</th><th>Actions</th></tr></thead><tbody id="parents"></tbody></table></section>
+<section><h2>Plan and execution</h2><label>Parent <select id="chartParent" aria-label="Chart parent"></select></label><div class="legend"><span style="border-color:#69b8ff">Planned</span><span style="border-color:#354f68">Tolerance band</span><span style="border-color:#55d9ad">Venue fills</span><span style="border-color:#ffc76a">Total fills (including wash)</span><span style="border-color:#bf9bff">Total fills + reserved</span></div><svg id="trajectoryChart" viewBox="0 0 1000 340" role="img" aria-labelledby="chartTitle chartDescription"></svg><p id="chartSummary">Connect to view a parent.</p><small>Plan uses the current parent specification: linear for TWAP/Passive, urgency curve for IS. The band shows pacing tolerances, not a fill guarantee. Execution is sampled while this page is connected; earlier history is unavailable. Amendments redraw the plan. Quantities are fixed-point instrument units.</small></section>
+<section><h2>Create parent</h2><form id="create" class="grid"><input name="id" type="number" placeholder="Parent ID" required><input name="instrument" type="number" value="1" aria-label="Instrument"><input name="account" type="number" value="1" aria-label="Account"><select name="side"><option>BUY</option><option>SELL</option></select><input name="quantity" type="number" value="100000000" aria-label="Quantity"><input name="limit" type="number" value="140000" aria-label="Fixed-point limit"><input name="durationSeconds" type="number" value="3600" aria-label="Duration seconds"><select name="strategy" id="strategy" aria-label="Strategy"><option>twap</option><option>is</option><option>passive</option></select><input name="param.destination" value="1" aria-label="Destination"><fieldset id="twapSettings"><legend>TWAP</legend><select name="param.mode"><option>balanced</option><option>aggressive</option></select></fieldset>
+<fieldset id="isSettings" hidden disabled><legend>IS against inception composite mid</legend><label>Reference destinations <input name="param.referenceDestinations" value="1" required></label><label>Urgency <input name="param.urgency" type="number" step="0.1" min="0" max="8" value="2"></label><label>Reference age (ms) <input name="param.referenceAgeMillis" type="number" value="1000"></label><label>Benchmark wait (ms) <input name="param.benchmarkWaitMillis" type="number" value="5000"></label></fieldset>
+<fieldset id="passiveSettings" hidden disabled><legend>Passive: post-only, no taking</legend><label>Working fraction <input name="param.workingFraction" type="number" step="0.01" min="0.01" max="1" value="0.10"></label><label>Improvement ticks <input name="param.improvementTicks" type="number" min="0" value="1"></label><label>Minimum resting time (ms) <input name="param.minimumRestingMillis" type="number" value="1000"></label></fieldset>
+<label>Layers <input name="param.layers" type="number" min="1" max="3" value="3"></label><label>Planning interval (ms) <input name="param.planningMillis" type="number" value="1000"></label><label>Ahead (s) <input name="param.aheadSeconds" type="number" value="30"></label><label>Behind (s) <input name="param.behindSeconds" type="number" value="60"></label><button>Create</button></form><small>Quantity and price are fixed-point values defined by the instrument. Commands are asynchronous. IS requires a fresh firm reference; Passive requires venue post-only protection and can expire incomplete.</small><pre id="strategyHelp"></pre></section>
+<section><h2>Manual residual completion</h2><form id="preview" class="grid"><input name="parent" type="number" placeholder="Parent ID" required><input name="version" type="number" placeholder="Version" required><input name="destination" type="number" value="1"><input name="washBook" value="WASH"><input name="reason" placeholder="Reason" required><button>Preview</button></form><form id="booking" class="grid"><input name="parent" type="number" placeholder="Parent ID" required><input name="preview" type="number" placeholder="Preview ID from events" required><input name="version" type="number" placeholder="Parent version" required><button class="danger">Confirm wash-book fill</button></form><small>Pause and resolve all children first. Review preview quantity and market price in the event log before confirming.</small></section>
+<section><h2>Health</h2><pre id="health"></pre></section><section><h2>Events and command outcomes</h2><pre id="events"></pre></section></main>
+<script>
+const $=id=>document.getElementById(id); let state,stream,connected=false,refreshing,refreshTimer,connectionGeneration=0; const histories=new Map(); const headers=()=>({'Authorization':'Bearer '+$('token').value});
+async function get(path){let r=await fetch(path,{headers:headers()});if(!r.ok)throw Error(await r.text());return r.json()}
+function log(value){$('events').textContent=(JSON.stringify(value)+'\n'+$('events').textContent).slice(0,30000)}
+async function post(path,data){let r=await fetch(path,{method:'POST',headers:{...headers(),'Content-Type':'application/x-www-form-urlencoded','Idempotency-Key':crypto.randomUUID()},body:new URLSearchParams(data)});let result=await r.json();log(result);if(!r.ok)throw Error(result.error);await refresh()}
+// Poll snapshots on the management path; never overlap requests or use wall time for chart data.
+async function refresh(){
+  if(refreshing)return refreshing;
+  refreshing=(async()=>{
+    const [snapshot,health]=await Promise.all([get('/api/state'),get('/api/health')]);
+    if(state && snapshot.logicalNanos<state.logicalNanos)histories.clear();
+    state=snapshot;$('health').textContent=JSON.stringify(health,null,2);
+    $('refreshStatus').textContent='Updated at engine time '+(state.logicalNanos/1e9).toFixed(2)+'s';
+    let tbody=$('parents');tbody.replaceChildren();
+    for(let p of state.parents){
+      recordSample(p,state.logicalNanos);
+      let tr=document.createElement('tr');
+      for(let value of [p.id,p.state+" / "+p.strategyState,p.venueFilled,p.washFilled,p.reserved,p.version,p.benchmark?(p.benchmark.bid/2+p.benchmark.ask/2):"—",p.executionCosts.venueShortfall??"—"]){let td=document.createElement('td');td.textContent=value;tr.append(td)}
+      let td=document.createElement('td');
+      let chart=document.createElement('button');chart.textContent='Chart';chart.onclick=()=>{$('chartParent').value=String(p.id);drawChart()};td.append(chart);
+      for(let action of ['pause','resume','cancel','restart']){let b=document.createElement('button');b.textContent=action;b.onclick=()=>post('/api/parents/'+p.id+'/'+action,{version:p.version}).catch(e=>log(e.message));td.append(b)}
+      tr.append(td);tbody.append(tr);
+    }
+    const selected=$('chartParent').value;
+    $('chartParent').replaceChildren(...state.parents.map(p=>{let option=document.createElement('option');option.value=String(p.id);option.textContent=p.id+' · '+p.strategy;return option}));
+    if(state.parents.some(p=>String(p.id)===selected))$('chartParent').value=selected;
+    const ids=new Set(state.parents.map(p=>p.id));for(const id of histories.keys())if(!ids.has(id))histories.delete(id);
+    drawChart();
+  })();
+  try{return await refreshing}finally{refreshing=null}
+}
+function recordSample(p,time){
+  let samples=histories.get(p.id);if(!samples){samples=[];histories.set(p.id,samples)}
+  const sample={time,venue:p.venueFilled,total:p.venueFilled+p.washFilled,exposure:p.venueFilled+p.washFilled+p.reserved};
+  if(samples.length && samples[samples.length-1].time===time)samples[samples.length-1]=sample;else samples.push(sample);
+  // Bound browser memory; retain first/last observations and thin older samples.
+  if(samples.length>2048)histories.set(p.id,samples.filter((_,i)=>i%2===0 || i===samples.length-1));
+}
+function planFraction(spec,time){
+  const u=Math.max(0,Math.min(1,(time-spec.startNanos)/(spec.endNanos-spec.startNanos)));
+  const k=spec.strategy==='is'?Number(spec.parameters.urgency??2):0;
+  return k<1e-6?u:1-Math.sinh(k*(1-u))/Math.sinh(k);
+}
+function planBand(spec,time){
+  const duration=spec.endNanos-spec.startNanos;
+  let lag=Number(spec.parameters.behindSeconds??60)*1e9;
+  const terminal=Math.min(60e9,duration/10),remaining=Math.max(0,spec.endNanos-time);
+  if(spec.strategy!=='passive' && remaining<=terminal && terminal>0)lag*=remaining/terminal;
+  return [planFraction(spec,time-lag),planFraction(spec,time+Number(spec.parameters.aheadSeconds??30)*1e9)];
+}
+function svgNode(tag,attributes={},text){let node=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [k,v] of Object.entries(attributes))node.setAttribute(k,v);if(text!==undefined)node.textContent=text;return node}
+function drawChart(){
+  const svg=$('trajectoryChart');svg.replaceChildren();
+  const p=state?.parents.find(p=>String(p.id)===$('chartParent').value);
+  if(!p){$('chartSummary').textContent='No parent selected.';return}
+  const spec=p.specification,samples=histories.get(p.id)??[],start=spec.startNanos;
+  const end=Math.max(spec.endNanos,state.logicalNanos,start+1),duration=end-start;
+  const max=Math.max(spec.quantity,...samples.map(s=>s.exposure),1);
+  const x=t=>70+Math.max(0,Math.min(1,(t-start)/duration))*900,y=q=>280-q/max*240;
+  svg.append(svgNode('title',{id:'chartTitle'},'Parent '+p.id+' plan and execution'),svgNode('desc',{id:'chartDescription'},'Cumulative quantity against elapsed engine time, with planned trajectory, tolerance band and sampled fills.'));
+  for(let i=0;i<=4;i++){
+    const q=max*i/4,xx=70+900*i/4;
+    svg.append(svgNode('line',{x1:70,x2:970,y1:y(q),y2:y(q),stroke:'#334452'}),svgNode('text',{x:62,y:y(q)+4,fill:'#8eacbf','text-anchor':'end','font-size':12},q.toLocaleString(undefined,{maximumFractionDigits:0})),svgNode('text',{x:xx,y:304,fill:'#8eacbf','text-anchor':'middle','font-size':12},(duration*i/4/1e9).toFixed(1)+'s'));
+  }
+  svg.append(svgNode('text',{x:520,y:330,fill:'#8eacbf','text-anchor':'middle','font-size':12},'Elapsed engine time from scheduled start'));
+  const times=Array.from({length:201},(_,i)=>start+(spec.endNanos-start)*i/200);
+  const points=(list,value)=>list.map(t=>x(t)+','+y(value(t))).join(' ');
+  svg.append(svgNode('polygon',{points:points(times,t=>spec.quantity*planBand(spec,t)[1])+' '+points([...times].reverse(),t=>spec.quantity*planBand(spec,t)[0]),fill:'#354f68',opacity:.6}),svgNode('polyline',{points:points(times,t=>spec.quantity*planFraction(spec,t)),fill:'none',stroke:'#69b8ff','stroke-width':2}));
+  for(const [key,color] of [['exposure','#bf9bff'],['total','#ffc76a'],['venue','#55d9ad']]){
+    // Step observations rather than imply continuous fills between polls. No invented pre-connection points.
+    let path='';samples.forEach((s,i)=>{path+=(i?' H '+x(s.time)+' V '+y(s[key]):'M '+x(s.time)+' '+y(s[key]))});
+    if(path)svg.append(svgNode('path',{d:path,fill:'none',stroke:color,'stroke-width':2}));
+    const last=samples.at(-1);if(last)svg.append(svgNode('circle',{cx:x(last.time),cy:y(last[key]),r:3,fill:color}));
+  }
+  svg.append(svgNode('line',{x1:x(state.logicalNanos),x2:x(state.logicalNanos),y1:40,y2:280,stroke:'#dae4ed','stroke-dasharray':'4 4'}));
+  const target=spec.quantity*planFraction(spec,state.logicalNanos),total=p.venueFilled+p.washFilled;
+  $('chartSummary').textContent=p.strategy+' · '+p.state+' / '+p.strategyState+' · Planned now '+Math.floor(target).toLocaleString()+' · Filled '+total.toLocaleString()+' · Reserved '+p.reserved.toLocaleString()+' · '+(total-target>=0?'Ahead ':'Behind ')+Math.round(Math.abs(total-target)).toLocaleString()+' units';
+}
+function scheduleRefresh(){clearTimeout(refreshTimer);if(connected && $('autoRefresh').checked)refreshTimer=setTimeout(async()=>{try{await refresh()}catch(e){$('refreshStatus').textContent='Refresh failed: '+e.message}finally{scheduleRefresh()}},1000)}
+$('autoRefresh').onchange=scheduleRefresh;
+$('chartParent').onchange=drawChart;
+document.addEventListener('visibilitychange',()=>{if(!document.hidden && connected)refresh().catch(e=>log(e.message))});
+function strategyFields(){for(let name of ['twap','is','passive']){let field=$(name+'Settings');field.hidden=name!==$('strategy').value;field.disabled=field.hidden}get('/api/strategies/'+encodeURIComponent($('strategy').value)).then(info=>$('strategyHelp').textContent=JSON.stringify(info.parameters,null,2)).catch(e=>log(e.message))}
+$('strategy').onchange=strategyFields;
+$('refresh').onclick=()=>refresh().catch(e=>log(e.message));
+$('connect').onclick=async()=>{
+  const generation=++connectionGeneration;connected=false;clearTimeout(refreshTimer);if(stream)stream.abort();
+  try{
+    await refresh();let available=await get('/api/strategies');
+    if(generation!==connectionGeneration)return;
+    $('strategy').replaceChildren(...available.map(name=>{let option=document.createElement('option');option.textContent=option.value=name;return option}));strategyFields();
+    connected=true;$('connection').textContent='Connected';scheduleRefresh();
+    stream=new AbortController();
+    let response=await fetch('/api/stream',{headers:headers(),signal:stream.signal});if(!response.ok)throw Error('Stream authentication failed');
+    let reader=response.body.getReader(),decoder=new TextDecoder(),buffer='';
+    while(generation===connectionGeneration){let {value,done}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});let parts=buffer.split('\n\n');buffer=parts.pop();for(let part of parts)if(part.startsWith('data: '))log(JSON.parse(part.slice(6)))}
+    if(generation===connectionGeneration)$('connection').textContent='Event stream ended; polling continues. Reconnect for events.';
+  }catch(e){if(generation!==connectionGeneration)return;$('connection').textContent=e.message;if(!connected)clearTimeout(refreshTimer)}
+};
+$('create').onsubmit=async e=>{e.preventDefault();try{await refresh();let f=Object.fromEntries(new FormData(e.target));f.startNanos=String(state.logicalNanos);f.endNanos=String(state.logicalNanos+Number(f.durationSeconds)*1e9);delete f.durationSeconds;await post('/api/parents',f)}catch(e){log(e.message)}};
+$('preview').onsubmit=e=>{e.preventDefault();let f=Object.fromEntries(new FormData(e.target)),parent=f.parent;delete f.parent;post('/api/parents/'+parent+'/preview',f).catch(e=>log(e.message))};
+$('booking').onsubmit=e=>{e.preventDefault();let f=Object.fromEntries(new FormData(e.target)),parent=f.parent;delete f.parent;f.bookingKey=crypto.randomUUID();post('/api/parents/'+parent+'/book',f).catch(e=>log(e.message))};
+</script></html>

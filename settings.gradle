@@ -1,0 +1,4 @@
+rootProject.name = 'strategy-container'
+include 'strategy-api', 'engine', 'example-twap'
+
+include 'execution-support', 'example-is', 'example-passive'
